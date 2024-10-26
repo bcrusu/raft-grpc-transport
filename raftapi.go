@@ -3,72 +3,70 @@ package transport
 import (
 	"context"
 	"io"
+	"strconv"
 	"sync"
 	"time"
 
 	pb "github.com/Jille/raft-grpc-transport/proto"
 	"github.com/hashicorp/raft"
-	"google.golang.org/grpc"
+	"google.golang.org/grpc/metadata"
 )
 
 // These are calls from the Raft engine that we need to send out over gRPC.
-
 type raftAPI struct {
-	manager *Manager
+	id               uint32
+	manager          *Manager
+	rpcChan          chan raft.RPC
+	heartbeatFuncMtx sync.Mutex
+	heartbeatFunc    func(raft.RPC)
+	connenctedMtx    sync.Mutex
+	connected        map[raft.ServerAddress]bool
 }
 
-var _ raft.Transport = raftAPI{}
-var _ raft.WithClose = raftAPI{}
-var _ raft.WithPeers = raftAPI{}
-var _ raft.WithPreVote = raftAPI{}
+var _ raft.Transport = &raftAPI{}
+var _ raft.WithClose = &raftAPI{}
+var _ raft.WithPeers = &raftAPI{}
+var _ raft.WithPreVote = &raftAPI{}
 
-type conn struct {
-	clientConn *grpc.ClientConn
-	client     pb.RaftTransportClient
-	mtx        sync.Mutex
+func newRaftAPI(id uint32, m *Manager) *raftAPI {
+	return &raftAPI{
+		id:        id,
+		manager:   m,
+		rpcChan:   make(chan raft.RPC),
+		connected: map[raft.ServerAddress]bool{},
+	}
 }
 
 // Consumer returns a channel that can be used to consume and respond to RPC requests.
-func (r raftAPI) Consumer() <-chan raft.RPC {
-	return r.manager.rpcChan
+func (r *raftAPI) Consumer() <-chan raft.RPC {
+	return r.rpcChan
 }
 
 // LocalAddr is used to return our local address to distinguish from our peers.
-func (r raftAPI) LocalAddr() raft.ServerAddress {
+func (r *raftAPI) LocalAddr() raft.ServerAddress {
 	return r.manager.localAddress
 }
 
-func (r raftAPI) getPeer(target raft.ServerAddress) (pb.RaftTransportClient, error) {
-	r.manager.connectionsMtx.Lock()
-	c, ok := r.manager.connections[target]
-	if !ok {
-		c = &conn{}
-		c.mtx.Lock()
-		r.manager.connections[target] = c
+func (r *raftAPI) getPeer(target raft.ServerAddress) (pb.RaftTransportClient, error) {
+	c, err := r.manager.connect(target)
+	if err != nil {
+		return nil, err
 	}
-	r.manager.connectionsMtx.Unlock()
-	if ok {
-		c.mtx.Lock()
-	}
-	defer c.mtx.Unlock()
-	if c.clientConn == nil {
-		conn, err := grpc.Dial(string(target), r.manager.dialOptions...)
-		if err != nil {
-			return nil, err
-		}
-		c.clientConn = conn
-		c.client = pb.NewRaftTransportClient(conn)
-	}
+
+	r.connenctedMtx.Lock()
+	r.connected[target] = true
+	r.connenctedMtx.Unlock()
+
 	return c.client, nil
 }
 
 // AppendEntries sends the appropriate RPC to the target node.
-func (r raftAPI) AppendEntries(id raft.ServerID, target raft.ServerAddress, args *raft.AppendEntriesRequest, resp *raft.AppendEntriesResponse) error {
+func (r *raftAPI) AppendEntries(id raft.ServerID, target raft.ServerAddress, args *raft.AppendEntriesRequest, resp *raft.AppendEntriesResponse) error {
 	c, err := r.getPeer(target)
 	if err != nil {
 		return err
 	}
-	ctx := context.TODO()
+	ctx := r.getRequestContext()
 	if r.manager.heartbeatTimeout > 0 && isHeartbeat(args) {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, r.manager.heartbeatTimeout)
@@ -83,12 +81,12 @@ func (r raftAPI) AppendEntries(id raft.ServerID, target raft.ServerAddress, args
 }
 
 // RequestVote sends the appropriate RPC to the target node.
-func (r raftAPI) RequestVote(id raft.ServerID, target raft.ServerAddress, args *raft.RequestVoteRequest, resp *raft.RequestVoteResponse) error {
+func (r *raftAPI) RequestVote(id raft.ServerID, target raft.ServerAddress, args *raft.RequestVoteRequest, resp *raft.RequestVoteResponse) error {
 	c, err := r.getPeer(target)
 	if err != nil {
 		return err
 	}
-	ret, err := c.RequestVote(context.TODO(), encodeRequestVoteRequest(args))
+	ret, err := c.RequestVote(r.getRequestContext(), encodeRequestVoteRequest(args))
 	if err != nil {
 		return err
 	}
@@ -97,12 +95,12 @@ func (r raftAPI) RequestVote(id raft.ServerID, target raft.ServerAddress, args *
 }
 
 // TimeoutNow is used to start a leadership transfer to the target node.
-func (r raftAPI) TimeoutNow(id raft.ServerID, target raft.ServerAddress, args *raft.TimeoutNowRequest, resp *raft.TimeoutNowResponse) error {
+func (r *raftAPI) TimeoutNow(id raft.ServerID, target raft.ServerAddress, args *raft.TimeoutNowRequest, resp *raft.TimeoutNowResponse) error {
 	c, err := r.getPeer(target)
 	if err != nil {
 		return err
 	}
-	ret, err := c.TimeoutNow(context.TODO(), encodeTimeoutNowRequest(args))
+	ret, err := c.TimeoutNow(r.getRequestContext(), encodeTimeoutNowRequest(args))
 	if err != nil {
 		return err
 	}
@@ -111,12 +109,12 @@ func (r raftAPI) TimeoutNow(id raft.ServerID, target raft.ServerAddress, args *r
 }
 
 // RequestPreVote is the command used by a candidate to ask a Raft peer for a vote in an election.
-func (r raftAPI) RequestPreVote(id raft.ServerID, target raft.ServerAddress, args *raft.RequestPreVoteRequest, resp *raft.RequestPreVoteResponse) error {
+func (r *raftAPI) RequestPreVote(id raft.ServerID, target raft.ServerAddress, args *raft.RequestPreVoteRequest, resp *raft.RequestPreVoteResponse) error {
 	c, err := r.getPeer(target)
 	if err != nil {
 		return err
 	}
-	ret, err := c.RequestPreVote(context.TODO(), encodeRequestPreVoteRequest(args))
+	ret, err := c.RequestPreVote(r.getRequestContext(), encodeRequestPreVoteRequest(args))
 	if err != nil {
 		return err
 	}
@@ -126,12 +124,12 @@ func (r raftAPI) RequestPreVote(id raft.ServerID, target raft.ServerAddress, arg
 
 // InstallSnapshot is used to push a snapshot down to a follower. The data is read from
 // the ReadCloser and streamed to the client.
-func (r raftAPI) InstallSnapshot(id raft.ServerID, target raft.ServerAddress, req *raft.InstallSnapshotRequest, resp *raft.InstallSnapshotResponse, data io.Reader) error {
+func (r *raftAPI) InstallSnapshot(id raft.ServerID, target raft.ServerAddress, req *raft.InstallSnapshotRequest, resp *raft.InstallSnapshotResponse, data io.Reader) error {
 	c, err := r.getPeer(target)
 	if err != nil {
 		return err
 	}
-	stream, err := c.InstallSnapshot(context.TODO())
+	stream, err := c.InstallSnapshot(r.getRequestContext())
 	if err != nil {
 		return err
 	}
@@ -163,19 +161,18 @@ func (r raftAPI) InstallSnapshot(id raft.ServerID, target raft.ServerAddress, re
 
 // AppendEntriesPipeline returns an interface that can be used to pipeline
 // AppendEntries requests.
-func (r raftAPI) AppendEntriesPipeline(id raft.ServerID, target raft.ServerAddress) (raft.AppendPipeline, error) {
+func (r *raftAPI) AppendEntriesPipeline(id raft.ServerID, target raft.ServerAddress) (raft.AppendPipeline, error) {
 	c, err := r.getPeer(target)
 	if err != nil {
 		return nil, err
 	}
-	ctx := context.TODO()
-	ctx, cancel := context.WithCancel(ctx)
+	ctx, cancel := context.WithCancel(r.getRequestContext())
 	stream, err := c.AppendEntriesPipeline(ctx)
 	if err != nil {
 		cancel()
 		return nil, err
 	}
-	rpa := raftPipelineAPI{
+	rpa := &raftPipelineAPI{
 		stream:     stream,
 		cancel:     cancel,
 		inflightCh: make(chan *appendFuture, 20),
@@ -195,7 +192,7 @@ type raftPipelineAPI struct {
 
 // AppendEntries is used to add another request to the pipeline.
 // The send may block which is an effective form of back-pressure.
-func (r raftPipelineAPI) AppendEntries(req *raft.AppendEntriesRequest, resp *raft.AppendEntriesResponse) (raft.AppendFuture, error) {
+func (r *raftPipelineAPI) AppendEntries(req *raft.AppendEntriesRequest, resp *raft.AppendEntriesResponse) (raft.AppendFuture, error) {
 	af := &appendFuture{
 		start:   time.Now(),
 		request: req,
@@ -216,12 +213,12 @@ func (r raftPipelineAPI) AppendEntries(req *raft.AppendEntriesRequest, resp *raf
 
 // Consumer returns a channel that can be used to consume
 // response futures when they are ready.
-func (r raftPipelineAPI) Consumer() <-chan raft.AppendFuture {
+func (r *raftPipelineAPI) Consumer() <-chan raft.AppendFuture {
 	return r.doneCh
 }
 
 // Close closes the pipeline and cancels all inflight RPCs
-func (r raftPipelineAPI) Close() error {
+func (r *raftPipelineAPI) Close() error {
 	r.cancel()
 	r.inflightChMtx.Lock()
 	close(r.inflightCh)
@@ -229,7 +226,7 @@ func (r raftPipelineAPI) Close() error {
 	return nil
 }
 
-func (r raftPipelineAPI) receiver() {
+func (r *raftPipelineAPI) receiver() {
 	for af := range r.inflightCh {
 		msg, err := r.stream.Recv()
 		if err != nil {
@@ -283,12 +280,12 @@ func (f *appendFuture) Response() *raft.AppendEntriesResponse {
 }
 
 // EncodePeer is used to serialize a peer's address.
-func (r raftAPI) EncodePeer(id raft.ServerID, addr raft.ServerAddress) []byte {
+func (r *raftAPI) EncodePeer(id raft.ServerID, addr raft.ServerAddress) []byte {
 	return []byte(addr)
 }
 
 // DecodePeer is used to deserialize a peer's address.
-func (r raftAPI) DecodePeer(p []byte) raft.ServerAddress {
+func (r *raftAPI) DecodePeer(p []byte) raft.ServerAddress {
 	return raft.ServerAddress(p)
 }
 
@@ -296,34 +293,46 @@ func (r raftAPI) DecodePeer(p []byte) raft.ServerAddress {
 // as a fast-pass. This is to avoid head-of-line blocking from
 // disk IO. If a Transport does not support this, it can simply
 // ignore the call, and push the heartbeat onto the Consumer channel.
-func (r raftAPI) SetHeartbeatHandler(cb func(rpc raft.RPC)) {
-	r.manager.heartbeatFuncMtx.Lock()
-	r.manager.heartbeatFunc = cb
-	r.manager.heartbeatFuncMtx.Unlock()
+func (r *raftAPI) SetHeartbeatHandler(cb func(rpc raft.RPC)) {
+	r.heartbeatFuncMtx.Lock()
+	r.heartbeatFunc = cb
+	r.heartbeatFuncMtx.Unlock()
 }
 
-func (r raftAPI) Close() error {
-	return r.manager.Close()
+func (r *raftAPI) Close() error {
+	r.DisconnectAll()
+	r.manager.removeTransport(r.id)
+	return nil
 }
 
-func (r raftAPI) Connect(target raft.ServerAddress, t raft.Transport) {
-	_, _ = r.getPeer(target)
-}
-
-func (r raftAPI) Disconnect(target raft.ServerAddress) {
-	r.manager.connectionsMtx.Lock()
-	c, ok := r.manager.connections[target]
-	if !ok {
-		delete(r.manager.connections, target)
-	}
-	r.manager.connectionsMtx.Unlock()
-	if ok {
-		c.mtx.Lock()
-		c.mtx.Unlock()
-		_ = c.clientConn.Close()
+func (r *raftAPI) Connect(target raft.ServerAddress, t raft.Transport) {
+	_, err := r.getPeer(target)
+	if err != nil {
+		r.manager.logger(err, "Failed to connect", "target", target)
 	}
 }
 
-func (r raftAPI) DisconnectAll() {
-	_ = r.manager.disconnectAll()
+func (r *raftAPI) Disconnect(target raft.ServerAddress) {
+	r.manager.disconnect(target)
+
+	r.connenctedMtx.Lock()
+	delete(r.connected, target)
+	r.connenctedMtx.Unlock()
+}
+
+func (r *raftAPI) DisconnectAll() {
+	r.connenctedMtx.Lock()
+	defer r.connenctedMtx.Unlock()
+
+	for target := range r.connected {
+		r.manager.disconnect(target)
+	}
+
+	r.connected = map[raft.ServerAddress]bool{}
+}
+
+func (r *raftAPI) getRequestContext() context.Context {
+	ctx := context.Background()
+	value := strconv.FormatUint(uint64(r.id), 10)
+	return metadata.AppendToOutgoingContext(ctx, metadataKey, value)
 }

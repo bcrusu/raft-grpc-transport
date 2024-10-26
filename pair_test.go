@@ -60,7 +60,8 @@ func makeTestPair(ctx context.Context, t *testing.T) (raft.Transport, raft.Trans
 		close(shutdownSig)
 	}()
 
-	return t1.Transport(), t2.Transport(), shutdownSig
+	id := uint32(123)
+	return t1.Transport(id), t2.Transport(id), shutdownSig
 }
 
 func TestAppendEntries(t *testing.T) {
@@ -80,8 +81,8 @@ func TestAppendEntries(t *testing.T) {
 			case <-stop:
 				return
 			case rpc := <-t2.Consumer():
-				if got, want := rpc.Command.(*raft.AppendEntriesRequest).Leader, []byte{3, 2, 1}; !bytes.Equal(got, want) {
-					t.Errorf("request.Leader = %v, want %v", got, want)
+				if got, want := rpc.Command.(*raft.AppendEntriesRequest).Addr, []byte{3, 2, 1}; !bytes.Equal(got, want) {
+					t.Errorf("request.Addr = %v, want %v", got, want)
 				}
 				if got, want := rpc.Command.(*raft.AppendEntriesRequest).Entries, []*raft.Log{
 					{Type: raft.LogNoop, Extensions: []byte{1}, Data: []byte{55}},
@@ -98,7 +99,9 @@ func TestAppendEntries(t *testing.T) {
 
 	var resp raft.AppendEntriesResponse
 	if err := t1.AppendEntries("t2", "t2", &raft.AppendEntriesRequest{
-		Leader: []byte{3, 2, 1},
+		RPCHeader: raft.RPCHeader{
+			Addr: []byte{3, 2, 1},
+		},
 		Entries: []*raft.Log{
 			{Type: raft.LogNoop, Extensions: []byte{1}, Data: []byte{55}},
 		},
@@ -130,8 +133,10 @@ func TestSnapshot(t *testing.T) {
 				return
 			case rpc := <-t2.Consumer():
 				if got, want := rpc.Command.(*raft.InstallSnapshotRequest), (&raft.InstallSnapshotRequest{
+					RPCHeader: raft.RPCHeader{
+						Addr: []byte{2},
+					},
 					Term:               123,
-					Leader:             []byte{2},
 					Configuration:      []byte{4, 2, 3},
 					ConfigurationIndex: 3,
 					Size:               654321,
@@ -169,8 +174,10 @@ func TestSnapshot(t *testing.T) {
 	var resp raft.InstallSnapshotResponse
 	b := bytes.Repeat([]byte{89}, 654321)
 	if err := t1.InstallSnapshot("t2", "t2", &raft.InstallSnapshotRequest{
+		RPCHeader: raft.RPCHeader{
+			Addr: []byte{2},
+		},
 		Term:               123,
-		Leader:             []byte{2},
 		Configuration:      []byte{4, 2, 3},
 		ConfigurationIndex: 3,
 		Size:               int64(len(b)),

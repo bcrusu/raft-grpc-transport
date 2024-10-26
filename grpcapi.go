@@ -2,13 +2,21 @@ package transport
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"io"
+	"strconv"
 
 	pb "github.com/Jille/raft-grpc-transport/proto"
 	"github.com/hashicorp/raft"
+	"google.golang.org/grpc/metadata"
 )
 
 // These are requests incoming over gRPC that we need to relay to the Raft engine.
+
+const (
+	metadataKey = "raft-id"
+)
 
 type gRPCAPI struct {
 	manager *Manager
@@ -17,7 +25,17 @@ type gRPCAPI struct {
 	pb.UnsafeRaftTransportServer
 }
 
-func (g gRPCAPI) handleRPC(command interface{}, data io.Reader) (interface{}, error) {
+func (g gRPCAPI) handleRPC(ctx context.Context, command interface{}, data io.Reader) (interface{}, error) {
+	id, err := getMetadataID(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	transport, ok := g.manager.getTransport(id)
+	if !ok {
+		return nil, fmt.Errorf("RPC request for unknown raft instance %d", id)
+	}
+
 	ch := make(chan raft.RPCResponse, 1)
 	rpc := raft.RPC{
 		Command:  command,
@@ -25,17 +43,17 @@ func (g gRPCAPI) handleRPC(command interface{}, data io.Reader) (interface{}, er
 		Reader:   data,
 	}
 	if isHeartbeat(command) {
-		// We can take the fast path and use the heartbeat callback and skip the queue in g.manager.rpcChan.
-		g.manager.heartbeatFuncMtx.Lock()
-		fn := g.manager.heartbeatFunc
-		g.manager.heartbeatFuncMtx.Unlock()
+		// We can take the fast path and use the heartbeat callback and skip the queue in transport.rpcChan
+		transport.heartbeatFuncMtx.Lock()
+		fn := transport.heartbeatFunc
+		transport.heartbeatFuncMtx.Unlock()
 		if fn != nil {
 			fn(rpc)
 			goto wait
 		}
 	}
 	select {
-	case g.manager.rpcChan <- rpc:
+	case transport.rpcChan <- rpc:
 	case <-g.manager.shutdownCh:
 		return nil, raft.ErrTransportShutdown
 	}
@@ -53,7 +71,7 @@ wait:
 }
 
 func (g gRPCAPI) AppendEntries(ctx context.Context, req *pb.AppendEntriesRequest) (*pb.AppendEntriesResponse, error) {
-	resp, err := g.handleRPC(decodeAppendEntriesRequest(req), nil)
+	resp, err := g.handleRPC(ctx, decodeAppendEntriesRequest(req), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -61,7 +79,7 @@ func (g gRPCAPI) AppendEntries(ctx context.Context, req *pb.AppendEntriesRequest
 }
 
 func (g gRPCAPI) RequestVote(ctx context.Context, req *pb.RequestVoteRequest) (*pb.RequestVoteResponse, error) {
-	resp, err := g.handleRPC(decodeRequestVoteRequest(req), nil)
+	resp, err := g.handleRPC(ctx, decodeRequestVoteRequest(req), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -69,7 +87,7 @@ func (g gRPCAPI) RequestVote(ctx context.Context, req *pb.RequestVoteRequest) (*
 }
 
 func (g gRPCAPI) TimeoutNow(ctx context.Context, req *pb.TimeoutNowRequest) (*pb.TimeoutNowResponse, error) {
-	resp, err := g.handleRPC(decodeTimeoutNowRequest(req), nil)
+	resp, err := g.handleRPC(ctx, decodeTimeoutNowRequest(req), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -77,7 +95,7 @@ func (g gRPCAPI) TimeoutNow(ctx context.Context, req *pb.TimeoutNowRequest) (*pb
 }
 
 func (g gRPCAPI) RequestPreVote(ctx context.Context, req *pb.RequestPreVoteRequest) (*pb.RequestPreVoteResponse, error) {
-	resp, err := g.handleRPC(decodeRequestPreVoteRequest(req), nil)
+	resp, err := g.handleRPC(ctx, decodeRequestPreVoteRequest(req), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -89,7 +107,7 @@ func (g gRPCAPI) InstallSnapshot(s pb.RaftTransport_InstallSnapshotServer) error
 	if err != nil {
 		return err
 	}
-	resp, err := g.handleRPC(decodeInstallSnapshotRequest(isr), &snapshotStream{s, isr.GetData()})
+	resp, err := g.handleRPC(s.Context(), decodeInstallSnapshotRequest(isr), &snapshotStream{s, isr.GetData()})
 	if err != nil {
 		return err
 	}
@@ -125,7 +143,7 @@ func (g gRPCAPI) AppendEntriesPipeline(s pb.RaftTransport_AppendEntriesPipelineS
 		if err != nil {
 			return err
 		}
-		resp, err := g.handleRPC(decodeAppendEntriesRequest(msg), nil)
+		resp, err := g.handleRPC(s.Context(), decodeAppendEntriesRequest(msg), nil)
 		if err != nil {
 			// TODO(quis): One failure doesn't have to break the entire stream?
 			// Or does it all go wrong when it's out of order anyway?
@@ -142,5 +160,28 @@ func isHeartbeat(command interface{}) bool {
 	if !ok {
 		return false
 	}
-	return req.Term != 0 && len(req.Leader) != 0 && req.PrevLogEntry == 0 && req.PrevLogTerm == 0 && len(req.Entries) == 0 && req.LeaderCommitIndex == 0
+	return req.Term != 0 && len(req.Addr) != 0 && req.PrevLogEntry == 0 && req.PrevLogTerm == 0 && len(req.Entries) == 0 && req.LeaderCommitIndex == 0
+}
+
+func getMetadataID(ctx context.Context) (uint32, error) {
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return 0, errors.New("metadata is missing")
+	}
+
+	values, ok := md[metadataKey]
+	if !ok {
+		return 0, errors.New("metadata does not contain raft-id")
+	}
+
+	if len(values) > 1 {
+		return 0, errors.New("metadata contains multiple raft-id values")
+	}
+
+	id, err := strconv.ParseUint(values[0], 10, 32)
+	if err != nil {
+		return 0, fmt.Errorf("failed to parse raft-id %q", values[0])
+	}
+
+	return uint32(id), nil
 }

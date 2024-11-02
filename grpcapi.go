@@ -9,7 +9,9 @@ import (
 
 	pb "github.com/Jille/raft-grpc-transport/proto"
 	"github.com/hashicorp/raft"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 )
 
 // These are requests incoming over gRPC that we need to relay to the Raft engine.
@@ -33,7 +35,7 @@ func (g gRPCAPI) handleRPC(ctx context.Context, command interface{}, data io.Rea
 
 	transport, ok := g.manager.getTransport(id)
 	if !ok {
-		return nil, fmt.Errorf("RPC request for unknown raft instance %d", id)
+		return nil, status.Errorf(codes.NotFound, "Unknown Raft instance %d.", id)
 	}
 
 	ch := make(chan raft.RPCResponse, 1)
@@ -54,6 +56,8 @@ func (g gRPCAPI) handleRPC(ctx context.Context, command interface{}, data io.Rea
 	}
 	select {
 	case transport.rpcChan <- rpc:
+	case <-transport.shutdownCh:
+		return nil, raft.ErrTransportShutdown
 	case <-g.manager.shutdownCh:
 		return nil, raft.ErrTransportShutdown
 	}
@@ -65,6 +69,8 @@ wait:
 			return nil, resp.Error
 		}
 		return resp.Response, nil
+	case <-transport.shutdownCh:
+		return nil, raft.ErrTransportShutdown
 	case <-g.manager.shutdownCh:
 		return nil, raft.ErrTransportShutdown
 	}

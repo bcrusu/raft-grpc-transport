@@ -159,6 +159,7 @@ func (m *Manager) disconnectAll() error {
 		conn.mtx.Unlock()
 
 		delete(m.connections, k)
+		delete(m.connectionsRefCount, k)
 	}
 
 	return errors.Join(errs...)

@@ -21,6 +21,9 @@ type raftAPI struct {
 	heartbeatFunc    func(raft.RPC)
 	connenctedMtx    sync.Mutex
 	connected        map[raft.ServerAddress]bool
+	shutdown         bool
+	shutdownCh       chan struct{}
+	shutdownLock     sync.Mutex
 }
 
 var _ raft.Transport = &raftAPI{}
@@ -30,10 +33,11 @@ var _ raft.WithPreVote = &raftAPI{}
 
 func newRaftAPI(id uint32, m *Manager) *raftAPI {
 	return &raftAPI{
-		id:        id,
-		manager:   m,
-		rpcChan:   make(chan raft.RPC),
-		connected: map[raft.ServerAddress]bool{},
+		id:         id,
+		manager:    m,
+		rpcChan:    make(chan raft.RPC),
+		connected:  map[raft.ServerAddress]bool{},
+		shutdownCh: make(chan struct{}),
 	}
 }
 
@@ -300,6 +304,16 @@ func (r *raftAPI) SetHeartbeatHandler(cb func(rpc raft.RPC)) {
 }
 
 func (r *raftAPI) Close() error {
+	r.shutdownLock.Lock()
+	defer r.shutdownLock.Unlock()
+
+	if r.shutdown {
+		return nil
+	}
+
+	close(r.shutdownCh)
+	r.shutdown = true
+
 	r.DisconnectAll()
 	r.manager.removeTransport(r.id)
 	return nil
